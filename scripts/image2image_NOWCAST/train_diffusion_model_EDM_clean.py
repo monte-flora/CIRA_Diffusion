@@ -12,7 +12,7 @@ You will need:
 3) Accelerate (this will help across GPUs if you have more than one)
 
 Author: Randy Chase 
-Date: May 2024 
+Date: June 2024 
 Email: randy 'dot' chase 'at' colostate.edu 
 
 Example call: 
@@ -61,14 +61,14 @@ from diffusers.utils.torch_utils import randn_tensor
 class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
     image_size = 256  # the generated image resolution, which is the same size of my training data, note it has to be square. 
-    train_batch_size = 45 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
+    train_batch_size = 20 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
     num_epochs = 500 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
     gradient_accumulation_steps = 1 # I havent gotting this working yet....
     learning_rate = 1e-4 #I am using a learning rate scheduler, not sure this is even used?
     lr_warmup_steps = 500 #not sure if a warmup is needed, but just left it 
     save_model_epochs = 1 #save the model every epoch, just in case things DIE 
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision 
-    output_dir = "/mnt/data1/diffusion_scorebased/"  # the local path to store the model 
+    output_dir = "/mnt/mlnas01/rchas1/diffusion_multigpu_4/"  # the local path to store the model 
     push_to_hub = False # whether to upload the saved model to the HF Hub, i havent tested this 
     hub_private_repo = False # or this 
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook 
@@ -283,8 +283,8 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
                 #send data into loss func and get the loss (the model call is in here)
                 per_sample_loss = loss_fn(model,clean_images, condition_images)
                 
-                #gather the mean loss across GPUs if you have more than one 
-                loss = accelerator.gather(per_sample_loss).mean()
+                #in the loss_fn, it returns the squarred error (per pixel basis), we need the mean for the loss  
+                loss = per_sample_loss.mean()
                 
                 #calc backprop 
                 accelerator.backward(loss)
@@ -377,7 +377,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
 config = TrainingConfig()
 
 #I have an exisiting datafile here 
-output_file = '/mnt/data1/nowcast_G16_V5.pt'
+output_file = '/mnt/mlnas01/rchas1/nowcast_G16_V5.pt'
 
 # Load the saved dataset from disk, this will take a min depending on the size 
 dataset = torch.load(output_file)
