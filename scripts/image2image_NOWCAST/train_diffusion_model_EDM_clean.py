@@ -60,15 +60,15 @@ from diffusers.utils.torch_utils import randn_tensor
 @dataclass
 class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
-    image_size = 256  # the generated image resolution, which is the same size of my training data, note it has to be square. 
-    train_batch_size = 45 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
+    image_size = 160  # the generated image resolution, which is the same size of my training data, note it has to be square. 
+    train_batch_size = 64 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
     num_epochs = 500 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
     gradient_accumulation_steps = 1 # I havent gotting this working yet....
     learning_rate = 1e-4 #I am using a learning rate scheduler, not sure this is even used?
-    lr_warmup_steps = 500 #not sure if a warmup is needed, but just left it 
+    lr_warmup_steps = 5 #not sure if a warmup is needed, but just left it 
     save_model_epochs = 1 #save the model every epoch, just in case things DIE 
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision 
-    output_dir = "/mnt/data1/diffusion_scorebased/"  # the local path to store the model 
+    output_dir = "/work/mflora/wofs-cast-data/diffusion_models/diffusion_v2"  # the local path to store the model 
     push_to_hub = False # whether to upload the saved model to the HF Hub, i havent tested this 
     hub_private_repo = False # or this 
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook 
@@ -78,23 +78,30 @@ class ConditionalGOES16_Nowcast(Dataset):
     
     """Dataset class for nowcasting dataset CIRA diffusion. This is needed to load my pretrained models. """ 
     
-    def __init__(self, next_image, conditional_images, metadata=None):
+    def __init__(self, next_image, conditional_images, mean, std, metadata=None):
         self.next_image = torch.tensor(next_image, dtype=torch.float32)
         self.conditional_images = torch.tensor(conditional_images, dtype=torch.float32)
         self.metadata = metadata
+        
+        self.mean = mean
+        self.std = std
 
     def __len__(self):
         return len(self.next_image)
 
     def __getitem__(self, index):
         next_image = self.next_image[index]
-        conditional_image = self.conditional_images[index]
+        conditional_images = self.conditional_images[index]
 
+        # Normalize the images
+        next_image = (next_image - self.mean) / self.std
+        conditional_images = (conditional_images - self.mean) / self.std
+        
         if self.metadata is not None:
             metadata = self.metadata[index]
             return next_image, conditional_images, metadata
         else:
-            return next_image, conditional_image
+            return next_image, conditional_images
     
 class EDMPrecond(torch.nn.Module):
     """ Original Func:: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/training/networks.py#L519
@@ -142,6 +149,7 @@ class EDMPrecond(torch.nn.Module):
         """
         
         x = x.to(torch.float32)
+
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
         
         #I dont think this is needed anymore... RJC 
@@ -157,9 +165,10 @@ class EDMPrecond(torch.nn.Module):
         c_noise = sigma.log() / 4
         
         #split out the noisy image YOU WILL HAVE TO CHANGE THIS IF YOU WANT TO DO MORE THAN 1 IMAGE PREDICTION 
-        x_noisy = torch.clone(x[:,0:1])
+        x_noisy = torch.clone(x[:,[0]])
         #the condition
-        x_condition = torch.clone(x[:,1:])
+        x_condition = torch.clone(x[:,[1]])
+        
         #concatinate back with the scaling applied to the noisy image 
         model_input_images = torch.cat([x_noisy*c_in, x_condition], dim=1)
         #do the model call 
@@ -268,14 +277,14 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
         #initalize loss to keep track of the mean loss across all batches in this epoch 
         epoch_loss = torch.tensor(0.0, device=accelerator.device)
         
-        for step, batch in enumerate(train_dataloader):
+        for step, (clean_images, condition_images) in enumerate(train_dataloader):
             
             #my data loader returns [clean_images,condition_images],I seperate them here just to be clear 
             # Sep. label 
-            clean_images = batch[0]
+            #clean_images = batch[0]
 
             #Sep. conditions
-            condition_images = batch[1]
+            #condition_images = batch[1]
             
             #this is the autograd steps within the .accumulate bit (this is important for multi-GPU training)
             with accelerator.accumulate(model):
@@ -373,25 +382,37 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
 
 #################### CODE ########################
 
+
+""" usage: stdbuf -oL python train_diffusion_model_EDM_clean.py > & log_training & """
+
 #initalize config 
 config = TrainingConfig()
 
 #I have an exisiting datafile here 
-output_file = '/mnt/data1/nowcast_G16_V5.pt'
+output_file = '/work/mflora/wofs-cast-data/predictions/wofscast_dataset_best_model.pt'
 
 # Load the saved dataset from disk, this will take a min depending on the size 
 dataset = torch.load(output_file)
 
+conditional_nowcast_dataset = ConditionalGOES16_Nowcast(
+    next_image=dataset['next_image'],
+    conditional_images=dataset['conditional_images'],
+    metadata=dataset.get('metadata'),
+    mean = torch.tensor(7.348, dtype=torch.float32),
+    std = torch.tensor(13.0, dtype=torch.float32),
+)
+
 #throw it in a dataloader for fast CPU handoffs. 
 #Note, you could add preprocessing steps with image permuations here i think 
-train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+train_dataloader = torch.utils.data.DataLoader(conditional_nowcast_dataset, 
+                                               batch_size=config.train_batch_size, shuffle=True)
 
 #go ahead and build a UNET, this was the exact same as the butterfly example, but different channels. This is a big model.. 
 # in_channels = noisy_dim + condition_channels. 
 
 model = UNet2DModel(
     sample_size=config.image_size,  # the target image resolution
-    in_channels=7,  # the number of input channels, 3 for RGB images
+    in_channels=2,  # Predicted and truth reflec.
     out_channels=1,  # the number of output channels
     layers_per_block=2,  # how many ResNet layers to use per UNet block
     block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
@@ -414,7 +435,7 @@ model = UNet2DModel(
 )
 
 #wrap diffusers/pytorch model 
-model_wrapped = EDMPrecond(256,1,model)
+model_wrapped = EDMPrecond(160,1,model)
 
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)
@@ -423,7 +444,6 @@ lr_scheduler = get_cosine_schedule_with_warmup(
     num_warmup_steps=config.lr_warmup_steps,
     num_training_steps=(len(train_dataloader) * config.num_epochs),
 )
-
 
 #main method here! 
 train_loop(config, model_wrapped, optimizer, train_dataloader, lr_scheduler)
