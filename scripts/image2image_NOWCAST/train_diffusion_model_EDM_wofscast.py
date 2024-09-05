@@ -47,6 +47,7 @@ from tqdm.auto import tqdm
 from pathlib import Path
 import os
 import math
+import time
 
 from diffusers.pipelines import DiffusionPipeline,ImagePipelineOutput
 from typing import List, Optional, Tuple, Union
@@ -66,21 +67,25 @@ class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
 
     image_size = 160  # the generated image resolution, which is the same size of my training data, note it has to be square. 
-    train_batch_size = 64 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
+    train_batch_size = 100 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
 
-    num_epochs = 2500 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
+    # For the full model, batch size of 50, but 100 for just refl.
+    n_channels = 1 
+    n_gpus = 1
+    num_epochs = 5000 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
     gradient_accumulation_steps = 1 # I havent gotting this working yet....
     learning_rate = 1e-4 #I am using a learning rate scheduler, not sure this is even used?
-    lr_warmup_steps = 500 #not sure if a warmup is needed, but just left it 
+    lr_warmup_steps = 3500 #not sure if a warmup is needed, but just left it 
     save_model_epochs = 1 #save the model every epoch, just in case things DIE 
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision 
 
-    output_dir = "/work/mflora/wofs-cast-data/diffusion_models/diffusion_8K_samples_300K_steps"  # the local path to store the model 
+    output_dir = '/ourdisk/hpc/ai2es/wofscast/diffusion_model_ckpts/diffusion_refl_only_'
 
     push_to_hub = False # whether to upload the saved model to the HF Hub, i havent tested this 
     hub_private_repo = False # or this 
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook 
     seed = 0 #random seed 
+
 
 class WoFSCastDataset(Dataset):
     
@@ -92,30 +97,42 @@ class WoFSCastDataset(Dataset):
     # cond = WoFSCast
     
     def __init__(self, 
-                 wofs_images, 
-                 wofscast_images, 
+                 wofscast_predictions, 
+                 target_residuals, 
+                 diffs_stddev_path=None,
+                 variable_indices=None,
                  metadata=None):
         
-        #self.wofs_images = torch.tensor(wofs_images, dtype=torch.float32)#.squeeze()
-        #self.wofscast_images = torch.tensor(wofscast_images, dtype=torch.float32)#.squeeze()
-        
-        self.wofs_images = wofs_images#.clone().detach().float().requires_grad_(True)
-        self.wofscast_images = wofscast_images#.clone().detach().float().requires_grad_(True)
-        
+       
+        self.wofscast_predictions = wofscast_predictions
+        self.target_residuals = target_residuals
+        self.variable_indices = variable_indices
         self.metadata = metadata
 
     def __len__(self):
-        return len(self.wofs_images)
+        return len(self.target_residuals)
 
     def __getitem__(self, index):
-        wofs_images = self.wofs_images[index]
-        wofscast_images = self.wofscast_images[index]
+        target_residuals = self.target_residuals[index]
+        wofscast_predictions = self.wofscast_predictions[index]
+
+        # Select a subset of variables. E.g., selecting
+        # only composite reflectivity. 
+        if self.variable_indices:
+            target_residuals = target_residuals[self.variable_indices]
+            wofscast_predictions = wofscast_predictions[self.variable_indices]
+
+        # DEPRECATED. NEW DATASETS ALREADY HAVE THE RESIDUALS!!
+        # Predicting the residual similar to CorrDiff
+        # residual = wofs - wofscast
+        # At sample time, wofscast + residual ~ wofs 
+        #residual = target_residuals - wofscast_predictions
 
         if self.metadata is not None:
             metadata = self.metadata[index]
-            return wofscast_images, wofs_images,  metadata
+            return wofscast_predictions, target_residuals, metadata
         else:
-            return wofscast_images, wofs_images
+            return wofscast_predictions, target_residuals
     
 class EDMPrecond(torch.nn.Module):
     """ Original Func:: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/training/networks.py#L519
@@ -194,7 +211,7 @@ class EDMLoss:
     This is the loss function class from Karras et al. (2022)'s EDM paper. Only thing changed here is that the __call__ takes the clean_images and the condition_images seperately. It expects your model to be wrapped with that EDMPrecond class. 
     
     """
-    def __init__(self, P_mean=0.0, # MLF: Changed from 1.2 -> 0.0 to match CorrDiff. 
+    def __init__(self, P_mean=-1.2,  
                  P_std=1.2, 
                  sigma_data=0.5, # MLF: Changed from 0.5 -> 1 to match GenCast 
                  ):
@@ -274,30 +291,27 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
     """ 
     This is the main show! the training loop 
     """
-    possibly_new_outpath = modify_path_if_exists(config.output_dir)
-    
-    # Initialize the Weights & Biases project for logging and tracking 
-    # training loss and other metrics. 
-    project_name = os.path.basename(possibly_new_outpath)
-    wandb.init(project='wofscast-gen',
-                   name = project_name,
-                  ) 
-    
-    
     # Initialize accelerator and tensorboard logging
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        log_with="tensorboard",
-        project_dir=os.path.join(possibly_new_outpath, "logs"),
+        log_with="wandb",
+        project_dir=os.path.join(config.output_dir, "logs"),
     )
-    if accelerator.is_main_process:
-        if config.push_to_hub:
-            repo_name = get_full_repo_name(Path(possibly_new_outpath).name)
-            repo = Repository(possibly_new_outpath, clone_from=repo_name)
-        elif possibly_new_outpath is not None:
-            os.makedirs(possibly_new_outpath, exist_ok=True)
-        accelerator.init_trackers("train_example")
+
+    if config.push_to_hub:
+            repo_name = get_full_repo_name(Path(config.output_dir).name)
+            repo = Repository(config.output_dir, clone_from=repo_name)
+    elif config.output_dir is not None:
+            os.makedirs(config.output_dir, exist_ok=True)
+    
+    accelerator.init_trackers(
+        project_name = "wofscast-gen", 
+        init_kwargs = {"wandb" : {"name" : os.path.basename(config.output_dir), 
+                                  "config" : config,
+                                  } 
+        }
+        )
 
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
@@ -382,26 +396,20 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
         loss_history.append(mean_epoch_loss.item())
         
         # Calculate the moving average if enough epochs have passed
-        if len(loss_history) >= window_size:
-            moving_average = sum(loss_history[-window_size:]) / window_size
-            logs = {"moving_epoch_loss": moving_average, "epoch": epoch}
-            accelerator.log(logs, step=epoch)
+        #if len(loss_history) >= window_size:
+        #    moving_average = sum(loss_history[-window_size:]) / window_size
+        #    logs = {"moving_epoch_loss": moving_average, "epoch": epoch}
+        #    accelerator.log(logs, step=epoch)
 
             # Check for improvement in the moving_average
-            if moving_average < (best_loss - min_delta):
-                best_loss = moving_average
-                no_improvement_count = 0
-            else:
-                no_improvement_count += 1
+       #     if moving_average < (best_loss - min_delta):
+       #         best_loss = moving_average
+       #         no_improvement_count = 0
+       #     else:
+       #         no_improvement_count += 1
         
         # This is the eval and saving step 
         if accelerator.is_main_process:
-            # Log metrics to wandb
-            wandb.log({f"Loss": mean_epoch_loss.item(), 
-                       'LR' : lr_scheduler.get_last_lr()[0], 
-                       'step' : global_step, 
-                      })
-            
             #This will be used when i get the right Diffusers pipeline. For now we just store the model 
             #pipeline = DDPMCondPipeline2(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler).to("cuda:0")
             
@@ -415,7 +423,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
                     repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
                 else:
                     #need to grab the unwrapped diffusers model from EDMPrecond 
-                    accelerator.unwrap_model(model).model.save_pretrained(possibly_new_outpath)
+                    accelerator.unwrap_model(model).model.save_pretrained(config.output_dir)
 
         # MLF: Comment out the early stopping procedure. 
         # Check if training should be stopped due to lack of improvement
@@ -430,79 +438,82 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
         gc.collect()
         
         
-        
+    accelerator.end_training()   
 
 
 #################### \Funcs ########################
 
 #################### CODE ########################
 
-
-""" usage: stdbuf -oL python train_diffusion_model_EDM_clean.py > & log_training & """
-""" usage: stdbuf -oL accelerate launch train_diffusion_model_EDM_clean.py  > & log_training & """
-
-#initalize config 
+#initalize config·
 config = TrainingConfig()
 
-#I have an exisiting datafile here 
+n_channels = config.n_channels # Hardcoded by MLF
+n_gpus = config.n_gpus # Hardcoded by MLF;used to compute number of training steps
 
-n_samples = 8000
-data_file = '/work/mflora/wofs-cast-data/predictions/wofscast_dataset_best_model_all_vars_norm_18K.pt'
-#data_file = '/work/mflora/wofs-cast-data/predictions/wofscast_dataset_best_model_all_vars_norm_test.pt'
+config.output_dir = modify_path_if_exists(config.output_dir)
+
+print(f'Saving data to {config.output_dir=}')
+
+#data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_10K_samples.pt'
+data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_160_samples.pt'
 
 
-# Load the norm stats 
 # Load the saved dataset from disk, this will take a min depending on the size 
-dataset = torch.load(data_file)
+print('\n Loading dataset...\n')
+start_time = time.time()
+dataset = torch.load(data_file, )
+print(f'Data Loading time: {time.time()-start_time:.3f} secs')
 
-torch_dataset = WoFSCastDataset(wofscast_images=dataset['conditional_images'], 
-                                wofs_images=dataset['next_image']
+# Only loading the composite reflectivity images
+torch_dataset = WoFSCastDataset(wofscast_predictions=dataset['input_images'], 
+                                target_residuals=dataset['target_images'],
+                                #variable_indices = [0],
                                )
+n_samples = len(torch_dataset)
+
+print(f'{len(torch_dataset)=}')
 
 #throw it in a dataloader for fast CPU handoffs. 
 #Note, you could add preprocessing steps with image permuations here i think 
 train_dataloader = torch.utils.data.DataLoader(torch_dataset, 
-                                               batch_size=config.train_batch_size, 
+                                               batch_size=config.train_batch_size,
                                                shuffle=True)
 
 #go ahead and build a UNET, this was the exact same as the butterfly example, but different channels. This is a big model.. 
 # in_channels = noisy_dim + condition_channels. 
-n_channels = 105
 model = UNet2DModel(
-    sample_size=config.image_size,  # the target image resolution
-    in_channels=2*n_channels,  # input and target set of images.
-    out_channels=1*n_channels,  # the number of output channels
-    layers_per_block=2,  # how many ResNet layers to use per UNet block
-    block_out_channels=(128, 128, 256, 256, 256, 256),  # the number of output channels for each UNet block
-    downsample_type='resnet', 
-    upsample_type='resnet', # Resnet rather than conv 
-    down_block_types=(
-        "DownBlock2D",  # a regular ResNet downsampling block
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-        "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-        "DownBlock2D",
-    ),
-    up_block_types=(
-        "UpBlock2D",  # a regular ResNet upsampling block
-        "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-    ),
-    dropout=0.1, 
-    
-)
-
-#wrap diffusers/pytorch model 
-n_channels = 105
+        sample_size=config.image_size,  # the target image resolution
+        in_channels=2*n_channels,  # input and target set of images.
+        out_channels=1*n_channels,  # the number of output channels
+        layers_per_block=2,  # how many ResNet layers to use per UNet block
+        block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
+        #downsample_type='resnet', 
+        #upsample_type='resnet', # Resnet rather than conv 
+        down_block_types=(
+            "DownBlock2D",  # a regular ResNet downsampling block
+            "DownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",
+            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "DownBlock2D",
+        ),
+        up_block_types=(
+            "UpBlock2D",  # a regular ResNet upsampling block
+            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+        ),
+        #dropout=0.1, 
+    )
 
 # MLF: Matching the sigma args to match GenCast
-model_wrapped = EDMPrecond(160, n_channels, model, 
-                           sigma_min=0.002, sigma_max=1000, 
-                           sigma_data=0.5)
+model_wrapped = EDMPrecond(config.image_size, n_channels, model,)  
+                           #sigma_min=0.002, 
+                           #sigma_max=1000, 
+                           #sigma_data=0.5)
 
 total_params = sum(p.numel() for p in model_wrapped.parameters())
 print(f"\n\nNumber of parameters: {total_params/1_000_000:.2f} Million\n\n")
@@ -510,16 +521,18 @@ print(f"\n\nNumber of parameters: {total_params/1_000_000:.2f} Million\n\n")
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), 
                               lr=config.learning_rate, 
-                              weight_decay=0.1 # MLF: Add to match GenCast
+                              weight_decay=0.0001 # MLF: Add to match GenCast
                              )
 
-num_steps = (n_samples / config.train_batch_size) * config.num_epochs
+num_steps = (n_samples / (n_gpus*config.train_batch_size)) * config.num_epochs
+
+print(f'{num_steps=}')
 
 lr_scheduler = get_cosine_schedule_with_warmup(
-    optimizer=optimizer,
-    num_warmup_steps=config.lr_warmup_steps,
-    num_training_steps=num_steps,
-)
+        optimizer=optimizer,
+        num_warmup_steps=config.lr_warmup_steps,
+        num_training_steps=num_steps,
+    )
 
 #main method here! 
 train_loop(config, model_wrapped, optimizer, train_dataloader, lr_scheduler)
