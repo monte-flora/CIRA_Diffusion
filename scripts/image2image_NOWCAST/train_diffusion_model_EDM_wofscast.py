@@ -27,11 +27,16 @@ TODO::
 
 #################### Imports ########################
 # Im sure there is an extra import or two, but havent cleaned it up yet. 
+import os
+
+# Set the OPENBLAS_NUM_THREADS environment variable
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader
-from diffusers import UNet2DModel,DDPMScheduler
+from diffusers import UNet2DModel, DDPMScheduler, DiTTransformer2DModel
 import torch
 from PIL import Image
 import numpy as np
@@ -39,13 +44,13 @@ import matplotlib.pyplot as plt
 from diffusers.optimization import get_cosine_schedule_with_warmup
 import torch.nn.functional as F
 import gc
-import os 
+ 
 import torch.distributed as dist
 from accelerate import Accelerator
 from huggingface_hub import HfFolder, Repository, whoami
 from tqdm.auto import tqdm
 from pathlib import Path
-import os
+
 import math
 import time
 
@@ -59,15 +64,16 @@ import wandb
 
 #################### Classes ########################
 
-
 # num_steps = (n_samples / batch_size) * epochs
 
 @dataclass
 class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
 
+    model_arch = 'dit' # DiT = DiffusionTransformer
+    
     image_size = 160  # the generated image resolution, which is the same size of my training data, note it has to be square. 
-    train_batch_size = 100 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
+    train_batch_size = 80 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
 
     # For the full model, batch size of 50, but 100 for just refl.
     n_channels = 1 
@@ -79,14 +85,20 @@ class TrainingConfig:
     save_model_epochs = 1 #save the model every epoch, just in case things DIE 
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision 
 
-    output_dir = '/ourdisk/hpc/ai2es/wofscast/diffusion_model_ckpts/diffusion_refl_only_'
+    #data_file = '/work/mflora/wofs-cast-data/predictions/wofscast_normalized_with_residual_160_samples.pt'
+    #data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_10K_samples.pt'
+    data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_160_samples.pt'
 
+    
+    output_dir = '/ourdisk/hpc/ai2es/wofscast/diffusion_model_ckpts/diffusion_refl_only_transformer'
+    #output_dir = '/work2/mflora/wofscast_diffusion_model_ckpts/diffusion_refl_only_transformer'
+    
     push_to_hub = False # whether to upload the saved model to the HF Hub, i havent tested this 
     hub_private_repo = False # or this 
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook 
     seed = 0 #random seed 
-
-
+    
+   
 class WoFSCastDataset(Dataset):
     
     """
@@ -191,8 +203,11 @@ class EDMPrecond(torch.nn.Module):
         #concatenate back with the scaling applied to the noisy image 
         model_input_images = torch.cat([x_noisy*c_in, x_condition], dim=1)
         
-        #do the model call 
-        F_x = self.model((model_input_images).to(dtype), c_noise.flatten(), return_dict=False)[0]
+        #denoise the image (e.g., run it through your diffusers model) 
+        F_x = self.model((model_input_images).to(dtype), c_noise.flatten(),
+                         class_labels=torch.zeros(model_input_images.shape[0], 
+                                                  dtype=torch.long).to(model_input_images.device),
+                         return_dict=False)[0]
  
         #is this needed? RJC 
         assert F_x.dtype == dtype
@@ -305,13 +320,13 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
     elif config.output_dir is not None:
             os.makedirs(config.output_dir, exist_ok=True)
     
-    accelerator.init_trackers(
-        project_name = "wofscast-gen", 
-        init_kwargs = {"wandb" : {"name" : os.path.basename(config.output_dir), 
-                                  "config" : config,
-                                  } 
-        }
-        )
+    #accelerator.init_trackers(
+    #    project_name = "wofscast-gen", 
+    #    init_kwargs = {"wandb" : {"name" : os.path.basename(config.output_dir), 
+    #                              "config" : config,
+    #                              } 
+    #    }
+    #    )
 
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
@@ -373,7 +388,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
             progress_bar.update(1)
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            #accelerator.log(logs, step=global_step)
             global_step += 1
 
         # Synchronize epoch loss across devices, this will just concat the two 
@@ -389,8 +404,8 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
         mean_epoch_loss = total_epoch_loss / total_samples_processed
         
         # Print or log the average epoch loss, need to convert to scalar to get tensorboard to work (using .item())
-        logs = {"epoch_loss": mean_epoch_loss.item(), "epoch": epoch}
-        accelerator.log(logs, step=epoch)
+        #logs = {"epoch_loss": mean_epoch_loss.item(), "epoch": epoch}
+        #accelerator.log(logs, step=epoch)
         
         #accumulate rolling mean 
         loss_history.append(mean_epoch_loss.item())
@@ -455,9 +470,7 @@ config.output_dir = modify_path_if_exists(config.output_dir)
 
 print(f'Saving data to {config.output_dir=}')
 
-#data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_10K_samples.pt'
-data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_160_samples.pt'
-
+data_file = config.data_file 
 
 # Load the saved dataset from disk, this will take a min depending on the size 
 print('\n Loading dataset...\n')
@@ -466,9 +479,14 @@ dataset = torch.load(data_file, )
 print(f'Data Loading time: {time.time()-start_time:.3f} secs')
 
 # Only loading the composite reflectivity images
+if n_channels == 1:
+    variable_indices = [0]
+else:
+    variable_indices= None
+
 torch_dataset = WoFSCastDataset(wofscast_predictions=dataset['input_images'], 
                                 target_residuals=dataset['target_images'],
-                                #variable_indices = [0],
+                                variable_indices = variable_indices,
                                )
 n_samples = len(torch_dataset)
 
@@ -480,9 +498,11 @@ train_dataloader = torch.utils.data.DataLoader(torch_dataset,
                                                batch_size=config.train_batch_size,
                                                shuffle=True)
 
-#go ahead and build a UNET, this was the exact same as the butterfly example, but different channels. This is a big model.. 
-# in_channels = noisy_dim + condition_channels. 
-model = UNet2DModel(
+if config.model_arch == 'unet2d':
+
+    #go ahead and build a UNET, this was the exact same as the butterfly example, but different channels. This is a big model.. 
+    # in_channels = noisy_dim + condition_channels. 
+    model = UNet2DModel(
         sample_size=config.image_size,  # the target image resolution
         in_channels=2*n_channels,  # input and target set of images.
         out_channels=1*n_channels,  # the number of output channels
@@ -507,8 +527,16 @@ model = UNet2DModel(
             "UpBlock2D",
         ),
         #dropout=0.1, 
-    )
-
+        )
+elif config.model_arch == 'dit':
+    model = DiTTransformer2DModel(
+        sample_size=config.image_size,  # the target image resolution
+        in_channels=2*n_channels,  # input and target set of images.
+        out_channels=1*n_channels,  # the number of output channels
+        num_layers = 6,
+        patch_size=8 
+    ) 
+    
 # MLF: Matching the sigma args to match GenCast
 model_wrapped = EDMPrecond(config.image_size, n_channels, model,)  
                            #sigma_min=0.002, 
