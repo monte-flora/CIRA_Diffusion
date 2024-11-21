@@ -29,14 +29,19 @@ TODO::
 # Im sure there is an extra import or two, but havent cleaned it up yet. 
 import os
 
+import wandb
+
+os.environ["WANDB__SERVICE_WAIT"] = "300"
+
 # Set the OPENBLAS_NUM_THREADS environment variable
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+#os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 
 from dataclasses import dataclass
+import dataclasses
 import torch
 from torch.utils.data import Dataset, DataLoader
-from diffusers import UNet2DModel, DDPMScheduler, DiTTransformer2DModel
+from diffusers import UNet2DModel, DDPMScheduler#, DiTTransformer2DModel
 import torch
 from PIL import Image
 import numpy as np
@@ -70,15 +75,15 @@ import wandb
 class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
 
-    model_arch = 'dit' # DiT = DiffusionTransformer
+    model_arch = 'unet2d' # DiT = DiffusionTransformer
     
     image_size = 160  # the generated image resolution, which is the same size of my training data, note it has to be square. 
-    train_batch_size = 80 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
+    train_batch_size = 100 #this was as manny batch,7,256,256 images i could fit in the 95 GB of RAM 
 
     # For the full model, batch size of 50, but 100 for just refl.
     n_channels = 1 
-    n_gpus = 1
-    num_epochs = 5000 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
+    n_gpus = 2
+    num_epochs = 4000 #how long to train, this is about where 'convergence' happened and takes 2 hours per epoch on 1 GPU. 
     gradient_accumulation_steps = 1 # I havent gotting this working yet....
     learning_rate = 1e-4 #I am using a learning rate scheduler, not sure this is even used?
     lr_warmup_steps = 3500 #not sure if a warmup is needed, but just left it 
@@ -86,11 +91,11 @@ class TrainingConfig:
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision 
 
     #data_file = '/work/mflora/wofs-cast-data/predictions/wofscast_normalized_with_residual_160_samples.pt'
-    #data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_10K_samples.pt'
-    data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_160_samples.pt'
+    data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_10K_samples.pt'
+    #data_file = '/ourdisk/hpc/ai2es/wofscast/wofscast_normalized_with_residual_160_samples.pt'
 
     
-    output_dir = '/ourdisk/hpc/ai2es/wofscast/diffusion_model_ckpts/diffusion_refl_only_transformer'
+    output_dir = '/ourdisk/hpc/ai2es/wofscast/diffusion_model_ckpts/diffusion_refl_only'
     #output_dir = '/work2/mflora/wofscast_diffusion_model_ckpts/diffusion_refl_only_transformer'
     
     push_to_hub = False # whether to upload the saved model to the HF Hub, i havent tested this 
@@ -205,8 +210,8 @@ class EDMPrecond(torch.nn.Module):
         
         #denoise the image (e.g., run it through your diffusers model) 
         F_x = self.model((model_input_images).to(dtype), c_noise.flatten(),
-                         class_labels=torch.zeros(model_input_images.shape[0], 
-                                                  dtype=torch.long).to(model_input_images.device),
+                         #class_labels=torch.zeros(model_input_images.shape[0], 
+                         #                         dtype=torch.long).to(model_input_images.device),
                          return_dict=False)[0]
  
         #is this needed? RJC 
@@ -319,14 +324,16 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
             repo = Repository(config.output_dir, clone_from=repo_name)
     elif config.output_dir is not None:
             os.makedirs(config.output_dir, exist_ok=True)
-    
-    #accelerator.init_trackers(
-    #    project_name = "wofscast-gen", 
-    #    init_kwargs = {"wandb" : {"name" : os.path.basename(config.output_dir), 
-    #                              "config" : config,
-    #                              } 
-    #    }
-    #    )
+   
+   
+    if accelerator.is_main_process: 
+        accelerator.init_trackers(
+            project_name = "wofscast-gen", 
+            init_kwargs = {"wandb" : {"name" : os.path.basename(config.output_dir), 
+                                     "config" : dataclasses.asdict(config),
+                                  } 
+            }
+            )
 
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
@@ -388,7 +395,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
             progress_bar.update(1)
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             progress_bar.set_postfix(**logs)
-            #accelerator.log(logs, step=global_step)
+            accelerator.log(logs, step=global_step)
             global_step += 1
 
         # Synchronize epoch loss across devices, this will just concat the two 
@@ -404,17 +411,17 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler):
         mean_epoch_loss = total_epoch_loss / total_samples_processed
         
         # Print or log the average epoch loss, need to convert to scalar to get tensorboard to work (using .item())
-        #logs = {"epoch_loss": mean_epoch_loss.item(), "epoch": epoch}
-        #accelerator.log(logs, step=epoch)
+        logs = {"epoch_loss": mean_epoch_loss.item(), "epoch": epoch}
+        accelerator.log(logs, step=epoch)
         
         #accumulate rolling mean 
         loss_history.append(mean_epoch_loss.item())
         
         # Calculate the moving average if enough epochs have passed
-        #if len(loss_history) >= window_size:
-        #    moving_average = sum(loss_history[-window_size:]) / window_size
-        #    logs = {"moving_epoch_loss": moving_average, "epoch": epoch}
-        #    accelerator.log(logs, step=epoch)
+        if len(loss_history) >= window_size:
+            moving_average = sum(loss_history[-window_size:]) / window_size
+            logs = {"moving_epoch_loss": moving_average, "epoch": epoch}
+            accelerator.log(logs, step=epoch)
 
             # Check for improvement in the moving_average
        #     if moving_average < (best_loss - min_delta):
@@ -507,9 +514,10 @@ if config.model_arch == 'unet2d':
         in_channels=2*n_channels,  # input and target set of images.
         out_channels=1*n_channels,  # the number of output channels
         layers_per_block=2,  # how many ResNet layers to use per UNet block
-        block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
-        #downsample_type='resnet', 
-        #upsample_type='resnet', # Resnet rather than conv 
+        #block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
+        block_out_channels = (128, 128, 256, 256, 256, 256), 
+        downsample_type='resnet', 
+        upsample_type='resnet', # Resnet rather than conv 
         down_block_types=(
             "DownBlock2D",  # a regular ResNet downsampling block
             "DownBlock2D",
@@ -526,7 +534,7 @@ if config.model_arch == 'unet2d':
             "UpBlock2D",
             "UpBlock2D",
         ),
-        #dropout=0.1, 
+        dropout=0.1, 
         )
 elif config.model_arch == 'dit':
     model = DiTTransformer2DModel(
